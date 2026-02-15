@@ -1,15 +1,19 @@
 """
-GRPO Training for Qwen2.5-VL on GSM8K
-======================================
+GRPO Training for Qwen2.5-VL on GSM8K (无 DeepSpeed 版本)
+========================================================
 
-使用 TRL 库的 GRPOTrainer 对 Qwen2.5-VL 模型在 GSM8K 数据集上进行
-Group Relative Policy Optimization (GRPO) 强化学习训练。
+纯 PyTorch 原生训练, 不依赖 DeepSpeed。
+适合单卡调试 或 多卡 DDP 训练。
 
-GRPO 算法核心思想:
-1. 对每个 prompt 采样一组 (G 个) completions
-2. 用 reward function 对每个 completion 打分
-3. 在组内计算相对优势 (advantage): A_i = (r_i - mean(r)) / std(r)
-4. 用 clipped surrogate objective 更新策略，保持策略不偏离太远
+显存优化策略:
+- gradient_checkpointing: 用计算换显存, 减少 ~40% 显存
+- bf16 混合精度: 参数用 BF16 存储, 减少一半显存
+- gradient_accumulation: 小 micro-batch + 梯度累积 = 大有效 batch
+
+与 DeepSpeed 版本的区别:
+- 没有 ZeRO 优化器分片 → 单卡需要更多显存
+- 没有 CPU offload → 优化器状态全在 GPU
+- 更简单, 调试更方便, 适合入门学习
 
 参考: DeepSeekMath (2402.03300)
 """
@@ -20,7 +24,7 @@ from pathlib import Path
 
 import torch
 from datasets import load_dataset, Dataset
-from transformers import AutoProcessor
+from transformers import AutoProcessor, BitsAndBytesConfig
 from trl import GRPOTrainer, GRPOConfig
 
 
@@ -31,9 +35,10 @@ from trl import GRPOTrainer, GRPOConfig
 def build_prompt(question: str) -> list[dict]:
     """
     构造 chat 格式的 prompt。
-    
-    system prompt 引导模型使用 <think>...</think> 进行推理，
-    最终把答案放在 \\boxed{} 中。
+
+    system prompt 引导模型:
+    - 在 <think>...</think> 中进行推理
+    - 最终答案放在 \\boxed{} 中
     """
     return [
         {
@@ -54,7 +59,7 @@ def build_prompt(question: str) -> list[dict]:
 def extract_ground_truth(answer_text: str) -> str:
     """
     从 GSM8K 的 answer 字段中提取数值答案。
-    
+
     GSM8K 格式: "...#### 42"  →  提取 "42"
     """
     match = re.search(r"####\s*(.+)", answer_text)
@@ -66,17 +71,15 @@ def extract_ground_truth(answer_text: str) -> str:
 def prepare_dataset(split: str = "train", data_path: str | None = None) -> Dataset:
     """
     加载 GSM8K 数据集并转换为 GRPOTrainer 所需的格式。
-    
+
     Args:
         split: 数据集划分 ("train" / "test")
-        data_path: 本地数据集路径，支持两种情况:
-            1. 目录: 包含 train/ test/ 子目录 (Arrow 格式, 由 dataset.save_to_disk() 保存)
-            2. 目录: 包含 .json / .jsonl / .parquet 文件
-            3. None: 从 HuggingFace Hub 在线下载
-    
-    GRPOTrainer 要求:
-    - `prompt` 列: 对话格式的 prompt (list[dict])
-    - 其他列: 可传递给 reward function 的额外信息
+        data_path: 本地数据集路径, 支持多种格式:
+            1. save_to_disk Arrow 目录 (含 train/ test/ 子目录)
+            2. HuggingFace Hub clone 的仓库 (含 main/ 子目录)
+            3. 直接包含 parquet/jsonl 文件的目录
+            4. 单个数据文件
+            5. None → 从 HuggingFace Hub 在线下载
     """
     if data_path is not None:
         local = Path(data_path)
@@ -84,18 +87,12 @@ def prepare_dataset(split: str = "train", data_path: str | None = None) -> Datas
         if not local.exists():
             raise FileNotFoundError(f"本地数据路径不存在: {data_path}")
 
-        # ---- 情况 1: save_to_disk 保存的 Arrow 目录 (含 train/ test/ 子目录) ----
-        #   结构: gsm8k/train/data-00000.arrow
-        #                test/data-00000.arrow
+        # ---- 情况 1: save_to_disk 的 Arrow 目录 ----
         if (local / split).is_dir() and list((local / split).glob("*.arrow")):
             ds = Dataset.load_from_disk(str(local / split))
 
-        # ---- 情况 2: HuggingFace Hub clone 下来的仓库 (含 config 子目录如 main/) ----
-        #   结构: gsm8k/main/train-00000-of-00001.parquet
-        #                main/test-00000-of-00001.parquet
-        #   load_dataset 需要传 config name ("main"), 它会自动按文件名前缀匹配 split
+        # ---- 情况 2: Hub clone 的仓库 (含 config 子目录如 main/) ----
         elif any(local.glob("*/{}*".format(split))):
-            # 找到包含 split 文件的子目录名 (如 "main")
             config_name = None
             for sub in local.iterdir():
                 if sub.is_dir() and list(sub.glob(f"{split}-*")):
@@ -103,35 +100,29 @@ def prepare_dataset(split: str = "train", data_path: str | None = None) -> Datas
                     break
             ds = load_dataset(str(local), name=config_name, split=split)
 
-        # ---- 情况 3: 目录下直接有 parquet/jsonl 文件 (无子目录) ----
-        #   结构: gsm8k/train-00000-of-00001.parquet
-        #               test-00000-of-00001.parquet
+        # ---- 情况 3: 目录下直接有数据文件 ----
         elif local.is_dir():
-            # 尝试找匹配 split 的文件
             matched = list(local.glob(f"{split}*.*"))
             if matched:
                 ds = load_dataset(
                     matched[0].suffix.lstrip("."),
                     data_files=[str(f) for f in matched],
-                    split="train",  # data_files 模式只有一个虚拟 split
+                    split="train",
                 )
             else:
-                # 兜底: 让 load_dataset 自己推断
                 ds = load_dataset(str(local), split=split)
 
-        # ---- 情况 4: 直接指向单个文件 ----
-        #   如: gsm8k/train.jsonl
+        # ---- 情况 4: 单个文件 ----
         elif local.is_file():
             ds = load_dataset(local.suffix.lstrip("."), data_files=str(local), split="train")
 
         else:
             raise FileNotFoundError(f"无法从该路径加载数据: {data_path}")
 
-        print(f"[DATA] 从本地加载数据集: {data_path} (split={split}, 样本数={len(ds)})")
+        print(f"[DATA] 从本地加载: {data_path} (split={split}, 样本数={len(ds)})")
     else:
-        # ---- 从 HuggingFace Hub 下载 ----
         ds = load_dataset("openai/gsm8k", "main", split=split)
-        print(f"[DATA] 从 HuggingFace Hub 加载: openai/gsm8k (split={split}, 样本数={len(ds)})")
+        print(f"[DATA] 从 Hub 加载: openai/gsm8k (split={split}, 样本数={len(ds)})")
 
     def transform(example):
         return {
@@ -144,22 +135,17 @@ def prepare_dataset(split: str = "train", data_path: str | None = None) -> Datas
 
 
 # ============================================================================
-# 2. 奖励函数: 评估模型输出的正确性和格式
+# 2. 奖励函数
 # ============================================================================
 
 def accuracy_reward(completions: list, ground_truth: list[str], **kwargs) -> list[float]:
     """
-    准确性奖励: 检查模型输出是否包含正确答案。
-    
-    从 completion 中提取 \\boxed{...} 内容，与 ground_truth 比较。
-    - 完全匹配 → 1.0
-    - 不匹配   → 0.0
+    准确性奖励: 从 \\boxed{} 提取答案, 与 ground_truth 精确匹配。
+    正确 → 1.0, 错误 → 0.0
     """
     rewards = []
     for completion, gt in zip(completions, ground_truth):
-        # 提取 completion 文本 (兼容 str 和 chat 格式)
         text = completion[0]["content"] if isinstance(completion, list) else completion
-        # 尝试匹配 \boxed{...}
         match = re.search(r"\\boxed\{([^}]*)\}", text)
         predicted = match.group(1).strip().replace(",", "") if match else ""
         rewards.append(1.0 if predicted == gt else 0.0)
@@ -168,11 +154,8 @@ def accuracy_reward(completions: list, ground_truth: list[str], **kwargs) -> lis
 
 def format_reward(completions: list, **kwargs) -> list[float]:
     """
-    格式奖励: 鼓励模型使用 <think>...</think> 和 \\boxed{} 的结构化格式。
-    
-    检查规则:
-    - 包含 <think> 和 </think> 标签 → +0.5
-    - 包含 \\boxed{} 答案框        → +0.5
+    格式奖励: 鼓励结构化输出。
+    有 <think>...</think> → +0.5, 有 \\boxed{} → +0.5
     """
     rewards = []
     for completion in completions:
@@ -191,37 +174,22 @@ def format_reward(completions: list, **kwargs) -> list[float]:
 # ============================================================================
 
 def parse_args():
-    """
-    解析命令行参数，支持本地模型/数据集路径。
-    
-    用法示例:
-      # 在线下载 (默认)
-      python train_grpo.py
-      
-      # 本地模型 + 本地数据
-      python train_grpo.py \
-          --model_path /data/models/Qwen2.5-VL-3B-Instruct \
-          --data_path  /data/datasets/gsm8k
-      
-      # 本地模型 + 在线数据
-      python train_grpo.py --model_path /data/models/Qwen2.5-VL-3B-Instruct
-    """
-    parser = argparse.ArgumentParser(description="GRPO Training for Qwen2.5-VL on GSM8K")
+    parser = argparse.ArgumentParser(description="GRPO Training (无 DeepSpeed)")
     parser.add_argument(
         "--model_path", type=str, default=None,
-        help="本地模型权重目录 (包含 config.json, model.safetensors 等)。"
-             "若不指定则从 HuggingFace Hub 下载 Qwen/Qwen2.5-VL-3B-Instruct"
+        help="本地模型路径, 不指定则从 Hub 下载 Qwen/Qwen2.5-VL-3B-Instruct"
     )
     parser.add_argument(
         "--data_path", type=str, default=None,
-        help="本地 GSM8K 数据集路径。支持: "
-             "1) save_to_disk 格式目录 (含 train/ test/ 子目录); "
-             "2) 含 .jsonl/.parquet 文件的目录; "
-             "3) 单个文件路径。若不指定则从 Hub 下载"
+        help="本地 GSM8K 数据集路径, 不指定则从 Hub 下载"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="./output/qwen25vl_gsm8k_grpo",
-        help="训练输出目录 (checkpoint, 日志, 最终模型)"
+        "--output_dir", type=str, default="./output/qwen25vl_gsm8k_grpo_simple",
+        help="训练输出目录"
+    )
+    parser.add_argument(
+        "--use_4bit", action="store_true",
+        help="启用 4-bit 量化加载模型 (QLoRA 风格, 大幅降低显存)"
     )
     return parser.parse_args()
 
@@ -229,36 +197,37 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ---- 模型路径: 本地目录 或 HuggingFace Hub ID ----
+    # ---- 模型路径 ----
     model_name = args.model_path or "Qwen/Qwen2.5-VL-3B-Instruct"
     print(f"[MODEL] 模型路径: {model_name}")
 
     # ---- 准备数据集 ----
-    train_dataset = prepare_dataset("train", data_path=args.data_path)  # ~7.5k 样本
-    eval_dataset  = prepare_dataset("test",  data_path=args.data_path)  # ~1.3k 样本
+    train_dataset = prepare_dataset("train", data_path=args.data_path)
+    eval_dataset  = prepare_dataset("test",  data_path=args.data_path)
 
-    # ---- GRPO 训练参数 ----
+    # ---- 训练参数 (不使用 DeepSpeed) ----
     training_args = GRPOConfig(
         output_dir=args.output_dir,
 
         # === 训练超参 ===
         num_train_epochs=2,
-        per_device_train_batch_size=2,         # 每卡 batch size
-        gradient_accumulation_steps=4,          # 有效 batch = 2 * 4 * n_gpu
-        learning_rate=1e-6,                     # GRPO 推荐较小学习率
+        per_device_train_batch_size=1,          # 无 ZeRO → 用更小的 batch
+        gradient_accumulation_steps=8,           # 补偿小 batch, 有效 batch = 1*8 = 8
+        learning_rate=1e-6,
         warmup_ratio=0.05,
         max_grad_norm=1.0,
-        bf16=True,                              # 使用 bfloat16 混合精度
-        
+        bf16=True,
+
         # === GRPO 特有参数 ===
-        num_generations=8,                      # 每个 prompt 生成 G=8 个候选
-        max_completion_length=1024,             # 最大生成长度
-        beta=0.001,                             # KL 散度系数 (约束策略偏移)
-        loss_type="dapo",                       # DAPO loss: 消除长度偏差
-        scale_rewards=True,                     # 组内标准差归一化
-        
-        # === DeepSpeed ===
-        deepspeed="ds_config_zero2.json",       # ZeRO-2 + CPU offload
+        num_generations=4,                       # 无 ZeRO 显存紧张, 减少到 G=4
+        max_completion_length=1024,
+        beta=0.001,
+        loss_type="dapo",
+        scale_rewards=True,
+
+        # === 显存优化 (替代 DeepSpeed 的方案) ===
+        gradient_checkpointing=True,             # 用计算换显存, 减少 ~40%
+        # 注意: 这里没有 deepspeed 参数!
 
         # === 日志与保存 ===
         logging_steps=5,
@@ -266,17 +235,28 @@ def main():
         save_steps=200,
         eval_strategy="steps",
         eval_steps=200,
-        log_completions=True,                   # 打印生成样例到日志
+        log_completions=True,
         report_to="tensorboard",
 
         # === 其他 ===
         seed=42,
-        remove_unused_columns=False,            # 保留 ground_truth 列给 reward
+        remove_unused_columns=False,
     )
 
-    # ---- 加载 processor (tokenizer + image_processor) ----
+    # ---- (可选) 4-bit 量化配置 ----
+    # 如果显存不够, 用 --use_4bit 开启量化加载
+    # 3B 模型: FP16 ~6GB → 4-bit ~2GB
+    model_kwargs = {}
+    if args.use_4bit:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,  # 计算时用 BF16
+            bnb_4bit_quant_type="nf4",               # NormalFloat4 量化
+        )
+        print("[MODEL] 启用 4-bit 量化 (NF4)")
+
+    # ---- 加载 processor ----
     processor = AutoProcessor.from_pretrained(model_name)
-    # GRPOTrainer 要求 padding_side = "left"
     processor.tokenizer.padding_side = "left"
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -286,25 +266,27 @@ def main():
         model=model_name,
         args=training_args,
         processing_class=processor,
-        reward_funcs=[accuracy_reward, format_reward],  # 多奖励函数, 分数累加
-        reward_weights=[1.0, 0.5],                      # 准确性权重 > 格式权重
+        reward_funcs=[accuracy_reward, format_reward],
+        reward_weights=[1.0, 0.5],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        model_init_kwargs=model_kwargs,              # 传入量化配置等
     )
 
     # ---- 开始训练 ----
     print("=" * 60)
-    print("Starting GRPO Training")
-    print(f"  Model:         {model_name}")
-    print(f"  Dataset:       GSM8K (train={len(train_dataset)}, eval={len(eval_dataset)})")
+    print("Starting GRPO Training (无 DeepSpeed)")
+    print(f"  Model:             {model_name}")
+    print(f"  4-bit quantized:   {args.use_4bit}")
+    print(f"  Grad checkpointing: True")
+    print(f"  Dataset:           GSM8K (train={len(train_dataset)}, eval={len(eval_dataset)})")
     print(f"  Generations/prompt: {training_args.num_generations}")
-    print(f"  Loss type:     {training_args.loss_type}")
-    print(f"  DeepSpeed:     ZeRO-2")
+    print(f"  Effective batch:   {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
     print("=" * 60)
 
     trainer.train()
 
-    # ---- 保存最终模型 ----
+    # ---- 保存 ----
     final_dir = str(Path(args.output_dir) / "final")
     trainer.save_model(final_dir)
     print(f"Training complete. Model saved to {final_dir}")
