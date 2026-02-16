@@ -219,7 +219,7 @@ def main():
         bf16=True,
 
         # === GRPO 特有参数 ===
-        num_generations=4,                       # 无 ZeRO 显存紧张, 减少到 G=4
+        num_generations=8,                       # 无 ZeRO 显存紧张, 减少到 G=8
         max_completion_length=1024,
         beta=0.001,
         loss_type="dapo",
@@ -236,24 +236,13 @@ def main():
         eval_strategy="steps",
         eval_steps=200,
         log_completions=True,
-        report_to="tensorboard",
+        report_to="none",
 
         # === 其他 ===
         seed=42,
         remove_unused_columns=False,
     )
 
-    # ---- (可选) 4-bit 量化配置 ----
-    # 如果显存不够, 用 --use_4bit 开启量化加载
-    # 3B 模型: FP16 ~6GB → 4-bit ~2GB
-    model_kwargs = {}
-    if args.use_4bit:
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,  # 计算时用 BF16
-            bnb_4bit_quant_type="nf4",               # NormalFloat4 量化
-        )
-        print("[MODEL] 启用 4-bit 量化 (NF4)")
 
     # ---- 加载 processor ----
     processor = AutoProcessor.from_pretrained(model_name)
@@ -266,18 +255,20 @@ def main():
         model=model_name,
         args=training_args,
         processing_class=processor,
-        reward_funcs=[accuracy_reward, format_reward],
-        reward_weights=[1.0, 0.5],
+        reward_funcs = [
+            match_format_exactly,
+            match_format_approximately,
+            check_answer,
+            check_numbers,
+        ],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        model_init_kwargs=model_kwargs,              # 传入量化配置等
     )
 
     # ---- 开始训练 ----
     print("=" * 60)
     print("Starting GRPO Training (无 DeepSpeed)")
     print(f"  Model:             {model_name}")
-    print(f"  4-bit quantized:   {args.use_4bit}")
     print(f"  Grad checkpointing: True")
     print(f"  Dataset:           GSM8K (train={len(train_dataset)}, eval={len(eval_dataset)})")
     print(f"  Generations/prompt: {training_args.num_generations}")
